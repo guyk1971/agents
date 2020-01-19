@@ -13,27 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Lint as: python2, python3
-r"""Train and Eval DQN.
+
+# Edited by guyk1971
+
+"""Train and Eval DQN.
 
 To run DQN on CartPole:
-
 ```bash
-tensorboard --logdir $HOME/tmp/dqn/gym/CartPole-v0/  &
-python tf_agents/agents/dqn/examples/v2/train_eval.py --gpu 1 \
-  --root_dir=$HOME/tmp/dqn/gym/CartPole-v0/ --alsologtostderr
+tensorboard --logdir <log_dir> --bind_all
+
+python dqn_hands_on_be.py --alsologtostderr  --n_experiments 3 --exp_json <json file name> --gpu 0 \
+  [--root_dir=$HOME/share/Data/MLA/agents/]
 ```
-
-To run DQN-RNNs on MaskedCartPole:
-
-```bash
-python tf_agents/agents/dqn/examples/v2/train_eval.py --gpu 1 \
-  --root_dir=$HOME/tmp/dqn_rnn/gym/MaskedCartPole-v0/ \
-  --gin_param='train_eval.env_name="MaskedCartPole-v0"' \
-  --gin_param='train_eval.train_sequence_length=10' \
-  --alsologtostderr
-```
-
 """
 
 from __future__ import absolute_import
@@ -56,11 +47,10 @@ import time
 from absl import app
 from absl import flags
 from absl import logging
-
-import gin
-from six.moves import range
-import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
-
+import random
+import numpy as np
+import tensorflow as tf
+import json
 from tf_agents.agents.dqn import dqn_agent
 from tf_agents.drivers import dynamic_step_driver
 from tf_agents.environments import suite_gym
@@ -74,20 +64,13 @@ from tf_agents.policies import random_tf_policy
 from tf_agents.replay_buffers import tf_uniform_replay_buffer
 from tf_agents.utils import common
 from tf_agents.utils.my_utils import set_gpu_device
-DEFAULT_ROOT_DIR = os.path.join(os.path.expanduser('~'),'share','Data','MLA','agents','results','orig')
-# flags.DEFINE_string('root_dir', os.getenv('TEST_UNDECLARED_OUTPUTS_DIR'),
-#                     'Root directory for writing logs/summaries/checkpoints.')
-flags.DEFINE_integer('num_iterations', 100000,
-                     'Total number train/eval iterations to perform.')
-flags.DEFINE_string('gpu', '0',
-                     'gpu ID to use. see nvidia-smi for gpu ids or -1 to use the cpu')
-flags.DEFINE_multi_string('gin_file', None, 'Paths to the gin-config files.')
-flags.DEFINE_multi_string('gin_param', None, 'Gin binding parameters.')
+from tqdm import tqdm
 
-FLAGS = flags.FLAGS
+# add a default path for the root dir. it will be $HOME/share/Data/MLA/agents
+# (e.g. /home/aahds_1/share/Data/MLA/agents)
+DEFAULT_ROOT_DIR = os.path.join(os.path.expanduser('~'),'share','Data','MLA','agents')
 
-
-@gin.configurable
+# @gin.configurable
 def train_eval(
         root_dir,
         env_name='CartPole-v0',
@@ -130,12 +113,16 @@ def train_eval(
         summaries_flush_secs=10,
         debug_summaries=False,
         summarize_grads_and_vars=False,
-        eval_metrics_callback=None):
+        eval_metrics_callback=None,
+        **kwargs):
+
+    # todo: save local parameters to file as a json (see my_vpg)
     """A simple train and eval for DQN."""
     root_dir = os.path.expanduser(root_dir)
     train_dir = os.path.join(root_dir, 'train')
     eval_dir = os.path.join(root_dir, 'eval')
 
+    tf.compat.v1.reset_default_graph()
     train_summary_writer = tf.compat.v2.summary.create_file_writer(
         train_dir, flush_millis=summaries_flush_secs * 1000)
     train_summary_writer.set_as_default()
@@ -280,7 +267,7 @@ def train_eval(
         if use_tf_functions:
             train_step = common.function(train_step)
 
-        for _ in range(num_iterations):
+        for _ in tqdm(range(num_iterations)):
             start_time = time.time()
             time_step, policy_state = collect_driver.run(
                 time_step=time_step,
@@ -329,16 +316,141 @@ def train_eval(
         return train_loss
 
 
-def main(_):
-    logging.set_verbosity(logging.INFO)
-    tf.compat.v1.enable_v2_behavior()  # according to documentation, we dont need to call it...
-    gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
-    set_gpu_device(FLAGS.gpu)
-    root_dir = DEFAULT_ROOT_DIR
-    train_eval(root_dir, num_iterations=FLAGS.num_iterations)
-    # train_eval(FLAGS.root_dir, num_iterations=FLAGS.num_iterations)
+def save_params(params,dir):
+    with open(os.path.join(dir, "params.json"), 'w') as out:
+        out.write(json.dumps(params, separators=(',\n','\t:\t'), sort_keys=True))
 
+
+def run_experiment(exp_params):
+
+    seed = exp_params['seed']
+    # set the seed in all environments
+    tf.random.set_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    logging.info('set seed to {0} and creating folder for results'.format(seed))
+
+    root_dir = os.path.join(exp_params['root_dir'],str(seed))
+    os.makedirs(root_dir)
+    exp_params['root_dir']=root_dir
+    train_eval(**exp_params)
+    return
+
+def_exp_params={'env_name':'CartPole-v0',
+                'num_iterations':100000,
+                'train_sequence_length':1,
+                # Params for QNetwork
+                'fc_layer_params':(100,),
+                # Params for QRnnNetwork
+                'input_fc_layer_params':(50,),
+                'lstm_size':(20,),
+                'output_fc_layer_params':(20,),
+                # Params for collect
+                'initial_collect_steps':1000,
+                'collect_steps_per_iteration':1,
+                'epsilon_greedy':0.1,
+                'replay_buffer_capacity':100000,
+                # Params for target update
+                'target_update_tau':0.05,
+                'target_update_period':5,
+                # Params for train
+                'train_steps_per_iteration':1,
+                'batch_size':64,
+                'learning_rate':1e-3,
+                'n_step_update':1,
+                'gamma':0.99,
+                'reward_scale_factor':1.0,
+                'gradient_clipping':None,
+                'use_tf_functions':True,
+                # Params for eval
+                'num_eval_episodes':10,
+                'eval_interval':1000,
+                # Params for checkpoints
+                'train_checkpoint_interval':10000,
+                'policy_checkpoint_interval':5000,
+                'rb_checkpoint_interval':20000,
+                # Params for summaries and logging
+                'log_interval':1000,
+                'summary_interval':1000,
+                'summaries_flush_secs':10,
+                'debug_summaries':False,
+                'summarize_grads_and_vars':False,
+                'eval_metrics_callback':None
+               }
+
+
+
+def main(_):
+    FLAGS.alsologtostderr = True
+    logging.set_verbosity(logging.INFO)
+
+    tf.compat.v1.enable_v2_behavior()  # according to documentation, we dont need to call it...
+    # gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
+    set_gpu_device(FLAGS.gpu)
+    root_dir = FLAGS.root_dir        # assuming the root dir already exists
+
+    # root dir is where the results of the experiments are saved. each experiment in its own folder
+    # <exp name>_<env name>_<time>
+    if root_dir is None:
+        root_dir = DEFAULT_ROOT_DIR
+    assert (os.path.exists(root_dir)), 'root dir {0} does not exist. create it first'.format(DEFAULT_ROOT_DIR)
+
+    # take default parameters from default json file
+    experiment_params = def_exp_params
+
+    # read the parameters from json. if only filename provided, look at the default path for jsons
+    if FLAGS.exp_json:
+        json_name = os.path.splitext(os.path.basename(FLAGS.exp_json))[0]
+        if os.path.isfile(FLAGS.exp_json):   # if the full path is given and there's a file, read it
+            logging.info('loading configuration from '+FLAGS.exp_json)
+            with open(FLAGS.exp_json,'r') as f:
+                experiment_params = json.load(f)
+        elif os.path.isfile(os.path.join(root_dir,'jsons',FLAGS.exp_json)):
+            json_path = os.path.join(root_dir,'jsons',FLAGS.exp_json)
+            logging.info('loading configuration from ' + json_path)
+            with open(json_path,'r') as f:
+                experiment_params = json.load(f)
+    else:
+        json_name = 'dqn_default'
+
+    # create results file (if not already exist)
+    root_dir = os.path.join(root_dir,'results')
+    if not(os.path.exists(root_dir)):
+        os.makedirs(root_dir)
+
+    # exp_root_dir = experiment_params['env_name'] + '_' + json_file + '_' + time.strftime("%d-%m-%Y_%H-%M-%S")
+    exp_root_dir = json_name + '_' + time.strftime("%d-%m-%Y_%H-%M-%S")
+    experiment_params['root_dir'] = os.path.join(root_dir,exp_root_dir)
+    os.makedirs(experiment_params['root_dir'])
+    logging.get_absl_handler().use_absl_log_file(log_dir=experiment_params['root_dir'])
+
+
+    for e in range(FLAGS.n_experiments):
+        seed = FLAGS.seed + 10*e
+        experiment_params['seed'] = seed
+        experiment_params['root_dir'] = os.path.join(root_dir, exp_root_dir)
+        run_experiment(experiment_params)
 
 if __name__ == '__main__':
     # flags.mark_flag_as_required('root_dir')
+    # Command line arguments
+    flags.DEFINE_string('root_dir', os.getenv('TEST_UNDECLARED_OUTPUTS_DIR'),
+                        'Root directory for writing logs/summaries/checkpoints.')
+
+    flags.DEFINE_string('exp_json', None,
+                        'experiment parameters json file')
+
+    flags.DEFINE_integer('n_experiments', 1,
+                         'Number of experiments to run (with different seeds)')
+
+    flags.DEFINE_integer('seed', 1,
+                         'the base seed to work with')
+
+    flags.DEFINE_string('gpu', '0',
+                        'gpu ID to use. see nvidia-smi for gpu ids or -1 to use the cpu')
+    flags.DEFINE_multi_string('gin_file', None, 'Paths to the gin-config files.')
+    flags.DEFINE_multi_string('gin_param', None, 'Gin binding parameters.')
+
+    FLAGS = flags.FLAGS
     app.run(main)
