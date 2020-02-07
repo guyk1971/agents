@@ -212,6 +212,57 @@ class ActionRepeat(PyEnvironmentBaseWrapper):
 
 
 @gin.configurable
+class ObservationFilterWrapper(PyEnvironmentBaseWrapper):
+  """Filters observations based on an array of indexes.
+
+  Note that this wrapper only supports single-dimensional observations.
+  """
+
+  def __init__(self, env, idx):
+    """Creates an observation filter wrapper.
+
+    Args:
+      env: Environment to wrap.
+      idx: Array of indexes pointing to elements to include in output.
+
+    Raises:
+      ValueError: If observation spec is nested.
+      ValueError: If indexes are not single-dimensional.
+      ValueError: If no index is provided.
+      ValueError: If one of the indexes is out of bounds.
+    """
+    super(ObservationFilterWrapper, self).__init__(env)
+    idx = np.array(idx)
+    if tf.nest.is_nested(env.observation_spec()):
+      raise ValueError('ObservationFilterWrapper only works with single-array '
+                       'observations (not nested).')
+    if len(idx.shape) != 1:
+      raise ValueError('ObservationFilterWrapper only works with '
+                       'single-dimensional indexes for filtering.')
+    if idx.shape[0] < 1:
+      raise ValueError('At least one index needs to be provided for filtering.')
+    if not np.all(idx < env.observation_spec().shape[0]):
+      raise ValueError('One of the indexes is out of bounds.')
+
+    self._idx = idx
+    self._observation_spec = array_spec.update_spec_shape(
+        env.observation_spec(), idx.shape)
+
+  def _step(self, action):
+    time_step = self._env.step(action)
+    return time_step._replace(observation=
+                              np.array(time_step.observation)[self._idx])
+
+  def observation_spec(self):
+    return self._observation_spec
+
+  def _reset(self):
+    time_step = self._env.reset()
+    return time_step._replace(observation=
+                              np.array(time_step.observation)[self._idx])
+
+
+@gin.configurable
 class RunStats(PyEnvironmentBaseWrapper):
   """Wrapper that accumulates run statistics as the environment iterates.
 
@@ -294,6 +345,7 @@ class ActionDiscretizeWrapper(PyEnvironmentBaseWrapper):
           'action spec. Got {}'.format(env.action_spec()))
 
     action_spec = action_spec[0]
+    self._original_spec = action_spec
     self._num_actions = np.broadcast_to(num_actions, action_spec.shape)
 
     if action_spec.shape != self._num_actions.shape:
@@ -319,15 +371,21 @@ class ActionDiscretizeWrapper(PyEnvironmentBaseWrapper):
       raise ValueError('num_actions should all be at least size 2.')
 
     limits = np.asarray(limits)
+    # Simplify shape of bounds if they are all equal.
+    if np.all(limits == limits.flat[0]):
+      limits = limits.flat[0]
+    # Workaround for b/148086610. Makes the discretized wrapper generate a
+    # scalar spec when possible.
+    shape = () if spec.shape == (1,) else spec.shape
     discrete_spec = array_spec.BoundedArraySpec(
-        shape=spec.shape,
+        shape=shape,
         dtype=np.int32,
         minimum=0,
         maximum=limits - 1,
         name=spec.name)
 
-    minimum = np.broadcast_to(spec.minimum, spec.shape)
-    maximum = np.broadcast_to(spec.maximum, spec.shape)
+    minimum = np.broadcast_to(spec.minimum, shape)
+    maximum = np.broadcast_to(spec.maximum, shape)
 
     action_map = [
         np.linspace(spec_min, spec_max, num=n_actions)
@@ -360,7 +418,7 @@ class ActionDiscretizeWrapper(PyEnvironmentBaseWrapper):
               action.shape, self._discrete_spec.shape))
 
     mapped_action = [action_map[i][a] for i, a in enumerate(action.flatten())]
-    return np.reshape(mapped_action, newshape=action.shape)
+    return np.reshape(mapped_action, newshape=self._original_spec.shape)
 
   def _step(self, action):
     """Steps the environment while remapping the actions.

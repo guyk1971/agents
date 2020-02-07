@@ -74,3 +74,97 @@ def get_num_actions_from_tensor_spec(action_spec):
     raise ValueError('Action spec must have minimum 0; '
                      'got {}'.format(action_spec.minimum))
   return action_spec.maximum + 1
+
+
+def build_laplacian_over_ordinal_integer_actions(action_spec):
+  """Build the unnormalized Laplacian matrix over ordinal integer actions.
+
+  Assuming integer actions, this functions builds the (unnormalized) Laplacian
+  matrix of the graph implied over the action space. The graph vertices are the
+  integers {0...action_spec.maximum - 1}. Two vertices are adjacent if they
+  correspond to consecutive integer actions. The `action_spec` must specify
+  a scalar int32 or int64 with minimum zero.
+
+  Args:
+    action_spec: a `BoundedTensorSpec`.
+
+  Returns:
+    The graph Laplacian matrix (float tensor) of size equal to the number of
+    actions. The diagonal elements are equal to 2 and the off-diagonal elements
+    are equal to -1.
+
+  Raises:
+    ValueError: if `action_spec` is not a bounded scalar int32 or int64 spec
+      with minimum 0.
+  """
+  num_actions = get_num_actions_from_tensor_spec(action_spec)
+  adjacency_matrix = tf.zeros([num_actions, num_actions], dtype=tf.float32)
+  row_indices = tf.reshape(tf.range(num_actions - 1), [-1, 1])
+  full_indices = tf.concat([row_indices, row_indices + 1], axis=1)
+  adjacency_matrix = tf.tensor_scatter_nd_update(
+      tensor=adjacency_matrix,
+      indices=full_indices,
+      updates=tf.ones([num_actions - 1], dtype=tf.float32))
+  adjacency_matrix = adjacency_matrix + tf.transpose(adjacency_matrix)
+  degree_matrix = tf.linalg.tensor_diag(tf.reduce_sum(adjacency_matrix, axis=1))
+  laplacian_matrix = degree_matrix - adjacency_matrix
+  return laplacian_matrix
+
+
+def compute_pairwise_distances(input_vecs):
+  """Compute the pairwise distances matrix.
+
+  Given input embedding vectors, this utility computes the (squared) pairwise
+  distances matrix.
+
+  Args:
+    input_vecs: a `Tensor`. Input embedding vectors (one per row).
+
+  Returns:
+    The (squared) pairwise distances matrix. A dense float `Tensor` of shape
+    [`num_vectors`, `num_vectors`], where `num_vectors` is the number of input
+    embedding vectors.
+  """
+  r = tf.reduce_sum(input_vecs * input_vecs, axis=1, keepdims=True)
+  pdistance_matrix = (
+      r - 2 * tf.matmul(input_vecs, input_vecs, transpose_b=True)
+      + tf.transpose(r))
+  return tf.cast(pdistance_matrix, dtype=tf.float32)
+
+
+def build_laplacian_nearest_neighbor_graph(input_vecs, k=1):
+  """Build the Laplacian matrix of a nearest neighbor graph.
+
+  Given input embedding vectors, this utility returns the Laplacian matrix of
+  the induced k-nearest-neighbor graph.
+
+  Args:
+    input_vecs: a `Tensor`. Input embedding vectors (one per row).  Shaped
+      `[num_vectors, ...]`.
+    k : an integer. Number of nearest neighbors to use.
+
+  Returns:
+    The graph Laplacian matrix. A dense float `Tensor` of shape
+    `[num_vectors, num_vectors]`, where `num_vectors` is the number of input
+    embedding vectors (`Tensor`).
+  """
+  num_actions = tf.shape(input_vecs)[0]
+  pdistance_matrix = compute_pairwise_distances(input_vecs)
+  sorted_indices = tf.argsort(values=pdistance_matrix)
+  selected_indices = tf.reshape(sorted_indices[:, 1 : k + 1], [-1, 1])
+  rng = tf.tile(
+      tf.expand_dims(tf.range(num_actions), axis=-1), [1, k])
+  rng = tf.reshape(rng, [-1, 1])
+  full_indices = tf.concat([rng, selected_indices], axis=1)
+  adjacency_matrix = tf.zeros([num_actions, num_actions], dtype=tf.float32)
+  adjacency_matrix = tf.tensor_scatter_nd_update(
+      tensor=adjacency_matrix,
+      indices=full_indices,
+      updates=tf.ones([k * num_actions], dtype=tf.float32))
+  # Symmetrize it.
+  adjacency_matrix = adjacency_matrix + tf.transpose(adjacency_matrix)
+  adjacency_matrix = tf.minimum(
+      adjacency_matrix, tf.ones_like(adjacency_matrix))
+  degree_matrix = tf.linalg.tensor_diag(tf.reduce_sum(adjacency_matrix, axis=1))
+  laplacian_matrix = degree_matrix - adjacency_matrix
+  return laplacian_matrix

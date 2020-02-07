@@ -92,8 +92,13 @@ class GreedyRewardPredictionPolicy(tf_policy.Base):
     if policy_utilities.InfoFields.PREDICTED_REWARDS_MEAN in emit_policy_info:
       predicted_rewards_mean = tensor_spec.TensorSpec(
           [self._expected_num_actions])
+    bandit_policy_type = ()
+    if policy_utilities.InfoFields.BANDIT_POLICY_TYPE in emit_policy_info:
+      bandit_policy_type = (
+          policy_utilities.create_bandit_policy_type_tensor_spec(shape=[1]))
     info_spec = policy_utilities.PolicyInfo(
-        predicted_rewards_mean=predicted_rewards_mean)
+        predicted_rewards_mean=predicted_rewards_mean,
+        bandit_policy_type=bandit_policy_type)
 
     super(GreedyRewardPredictionPolicy, self).__init__(
         time_step_spec, action_spec,
@@ -114,6 +119,7 @@ class GreedyRewardPredictionPolicy(tf_policy.Base):
     if observation_and_action_constraint_splitter is not None:
       observation, mask = observation_and_action_constraint_splitter(
           observation)
+    batch_size = tf.shape(observation)[0]
 
     predictions, policy_state = self._reward_network(
         observation, time_step.step_type, policy_state)
@@ -139,10 +145,17 @@ class GreedyRewardPredictionPolicy(tf_policy.Base):
           predicted_reward_values, axis=-1, output_type=self.action_spec.dtype)
     actions += self._action_offset
 
+    bandit_policy_values = tf.fill([batch_size, 1],
+                                   policy_utilities.BanditPolicyType.GREEDY)
+
     policy_info = policy_utilities.PolicyInfo(
         predicted_rewards_mean=(
             predicted_reward_values if
             policy_utilities.InfoFields.PREDICTED_REWARDS_MEAN in
+            self._emit_policy_info else ()),
+        bandit_policy_type=(
+            bandit_policy_values if
+            policy_utilities.InfoFields.BANDIT_POLICY_TYPE in
             self._emit_policy_info else ()))
 
     return policy_step.PolicyStep(
