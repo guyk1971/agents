@@ -22,6 +22,7 @@ from __future__ import print_function
 import numbers
 
 import numpy as np
+from six.moves import zip
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 
 from tf_agents.utils import composite
@@ -488,6 +489,23 @@ def unbatch_nested_array(nested_array):
   return tf.nest.map_structure(lambda x: np.squeeze(x, 0), nested_array)
 
 
+def unbatch_nested_tensors_to_arrays(nested_tensors):
+
+  def _to_unbatched_numpy(tensor):
+    return np.squeeze(tensor.numpy(), 0)
+
+  return tf.nest.map_structure(_to_unbatched_numpy, nested_tensors)
+
+
+def _unstack_nested_arrays_into_flat_item_iterator(nested_array):
+
+  def _unstack(array):
+    # Use numpy views instead of np.split, it's 5x+ faster.
+    return [array[i] for i in range(len(array))]
+
+  return zip(*[_unstack(array) for array in tf.nest.flatten(nested_array)])
+
+
 def unstack_nested_arrays(nested_array):
   """Unstack/unbatch a nest of numpy arrays.
 
@@ -500,19 +518,30 @@ def unstack_nested_arrays(nested_array):
       having the same structure as `nested_array`.
   """
 
-  def _unstack(array):
-    if array.shape[0] == 1:
-      arrays = [array]
-    else:
-      arrays = np.split(array, array.shape[0])
-    return [np.reshape(a, a.shape[1:]) for a in arrays]
-
-  unstacked_arrays_zipped = zip(
-      *[_unstack(array) for array in tf.nest.flatten(nested_array)])
   return [
       tf.nest.pack_sequence_as(nested_array, zipped)
-      for zipped in unstacked_arrays_zipped
+      for zipped in _unstack_nested_arrays_into_flat_item_iterator(nested_array)
   ]
+
+
+def unstack_nested_arrays_into_flat_items(nested_array):
+  """Unstack/unbatch a nest of numpy arrays into flat items.
+
+  Rebuild the nested structure of the unbatched elements is expensive. On the
+  other hand it is sometimes unnecessary (e.g. if the downstream processing
+  requires flattened structure, e.g. some replay buffer writers which flattens
+  the items anyway).
+
+  Args:
+    nested_array: Nest of numpy arrays where each array has shape [batch_size,
+      ...].
+
+  Returns:
+    A list of length batch_size where each item in the list is the flattened
+      version of the corresponding item of the input.
+  """
+
+  return list(_unstack_nested_arrays_into_flat_item_iterator(nested_array))
 
 
 def stack_nested_arrays(nested_arrays):

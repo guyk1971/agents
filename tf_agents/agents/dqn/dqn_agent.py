@@ -37,7 +37,6 @@ from tf_agents.policies import greedy_policy
 from tf_agents.policies import q_policy
 from tf_agents.trajectories import trajectory
 from tf_agents.utils import common
-from tf_agents.utils import composite
 from tf_agents.utils import eager_utils
 from tf_agents.utils import nest_utils
 from tf_agents.utils import training as training_lib
@@ -332,18 +331,6 @@ class DqnAgent(tf_agent.TFAgent):
 
       return common.Periodically(update, period, 'periodic_update_targets')
 
-  def _experience_to_transitions(self, experience):
-    transitions = trajectory.to_transition(experience)
-
-    # Remove time dim if we are not using a recurrent network.
-    if not self._q_network.state_spec:
-      transitions = tf.nest.map_structure(lambda x: composite.squeeze(x, 1),
-                                          transitions)
-
-    time_steps, policy_steps, next_time_steps = transitions
-    actions = policy_steps.action
-    return time_steps, actions, next_time_steps
-
   # Use @common.function in graph mode or for speeding up.
   def _train(self, experience, weights):
     with tf.GradientTape() as tape:
@@ -354,7 +341,7 @@ class DqnAgent(tf_agent.TFAgent):
           reward_scale_factor=self._reward_scale_factor,
           weights=weights,
           training=True)
-    tf.debugging.check_numerics(loss_info[0], 'Loss is inf or nan')
+    tf.debugging.check_numerics(loss_info.loss, 'Loss is inf or nan')
     variables_to_train = self._q_network.trainable_weights
     non_trainable_weights = self._q_network.non_trainable_weights
     assert list(variables_to_train), "No variables in the agent's q_network."
@@ -413,22 +400,30 @@ class DqnAgent(tf_agent.TFAgent):
     # method requires a time dimension to compute the loss properly.
     self._check_trajectory_dimensions(experience)
 
+    squeeze_time_dim = not self._q_network.state_spec
     if self._n_step_update == 1:
-      time_steps, actions, next_time_steps = self._experience_to_transitions(
-          experience)
+      time_steps, policy_steps, next_time_steps = (
+          trajectory.experience_to_transitions(experience, squeeze_time_dim))
+      actions = policy_steps.action
     else:
       # To compute n-step returns, we need the first time steps, the first
       # actions, and the last time steps. Therefore we extract the first and
       # last transitions from our Trajectory.
       first_two_steps = tf.nest.map_structure(lambda x: x[:, :2], experience)
       last_two_steps = tf.nest.map_structure(lambda x: x[:, -2:], experience)
-      time_steps, actions, _ = self._experience_to_transitions(first_two_steps)
-      _, _, next_time_steps = self._experience_to_transitions(last_two_steps)
+      time_steps, policy_steps, _ = (
+          trajectory.experience_to_transitions(
+              first_two_steps, squeeze_time_dim))
+      actions = policy_steps.action
+      _, _, next_time_steps = (
+          trajectory.experience_to_transitions(
+              last_two_steps, squeeze_time_dim))
 
     with tf.name_scope('loss'):
       q_values = self._compute_q_values(time_steps, actions, training=training)
 
-      next_q_values = self._compute_next_q_values(next_time_steps)
+      next_q_values = self._compute_next_q_values(
+          next_time_steps, policy_steps.info)
 
       if self._n_step_update == 1:
         # Special case for n = 1 to avoid a loss of performance.
@@ -463,25 +458,27 @@ class DqnAgent(tf_agent.TFAgent):
         # Do a sum over the time dimension.
         td_loss = tf.reduce_sum(input_tensor=td_loss, axis=1)
 
-      if weights is not None:
-        td_loss *= weights
-
-      # Average across the elements of the batch.
+      # Aggregate across the elements of the batch and add regularization loss.
       # Note: We use an element wise loss above to ensure each element is always
       #   weighted by 1/N where N is the batch size, even when some of the
       #   weights are zero due to boundary transitions. Weighting by 1/K where K
       #   is the actual number of non-zero weight would artificially increase
       #   their contribution in the loss. Think about what would happen as
       #   the number of boundary samples increases.
-      loss = tf.reduce_mean(input_tensor=td_loss)
 
-      # Add network loss (such as regularization loss)
-      if self._q_network.losses:
-        loss = loss + tf.reduce_mean(self._q_network.losses)
+      agg_loss = common.aggregate_losses(
+          per_example_loss=td_loss,
+          sample_weight=weights,
+          regularization_loss=self._q_network.losses)
+      total_loss = agg_loss.total_loss
 
-      with tf.name_scope('Losses/'):
-        tf.compat.v2.summary.scalar(
-            name='loss', data=loss, step=self.train_step_counter)
+      losses_dict = {'td_loss': agg_loss.weighted,
+                     'reg_loss': agg_loss.regularization,
+                     'total_loss': total_loss}
+
+      common.summarize_scalar_dict(losses_dict,
+                                   step=self.train_step_counter,
+                                   name_scope='Losses/')
 
       if self._summarize_grads_and_vars:
         with tf.name_scope('Variables/'):
@@ -504,8 +501,8 @@ class DqnAgent(tf_agent.TFAgent):
         common.generate_tensor_summaries('diff_q_values', diff_q_values,
                                          self.train_step_counter)
 
-      return tf_agent.LossInfo(loss, DqnLossInfo(td_loss=td_loss,
-                                                 td_error=td_error))
+      return tf_agent.LossInfo(total_loss, DqnLossInfo(td_loss=td_loss,
+                                                       td_error=td_error))
 
   def _compute_q_values(self, time_steps, actions, training=False):
     network_observation = time_steps.observation
@@ -524,11 +521,13 @@ class DqnAgent(tf_agent.TFAgent):
         tf.cast(actions, dtype=tf.int32),
         multi_dim_actions=multi_dim_actions)
 
-  def _compute_next_q_values(self, next_time_steps):
+  def _compute_next_q_values(self, next_time_steps, info):
     """Compute the q value of the next state for TD error computation.
 
     Args:
       next_time_steps: A batch of next timesteps
+      info: PolicyStep.info that may be used by other agents inherited from
+        dqn_agent.
 
     Returns:
       A tensor of Q values for the given next state.
@@ -570,15 +569,18 @@ class DdqnAgent(DqnAgent):
 
   """
 
-  def _compute_next_q_values(self, next_time_steps):
+  def _compute_next_q_values(self, next_time_steps, info):
     """Compute the q value of the next state for TD error computation.
 
     Args:
       next_time_steps: A batch of next timesteps
+      info: PolicyStep.info that may be used by other agents inherited from
+        dqn_agent.
 
     Returns:
       A tensor of Q values for the given next state.
     """
+    del info
     # TODO(b/117175589): Add binary tests for DDQN.
     network_observation = next_time_steps.observation
 

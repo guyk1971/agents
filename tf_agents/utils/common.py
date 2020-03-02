@@ -19,7 +19,9 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import collections as cs
 import functools
+import importlib
 import os
 
 from absl import logging
@@ -33,9 +35,18 @@ from tf_agents.utils import nest_utils
 
 # pylint:disable=g-direct-tensorflow-import
 from tensorflow.core.protobuf import struct_pb2  # TF internal
+from tensorflow.python import tf2 as tf2_checker  # TF internal
 from tensorflow.python.eager import monitoring  # TF internal
 from tensorflow.python.saved_model import nested_structure_coder  # TF internal
 # pylint:enable=g-direct-tensorflow-import
+
+try:
+  importlib.import_module('tf_agents.utils.allow_tf1')
+except ImportError:
+  _TF1_MODE_ALLOWED = False
+else:
+  _TF1_MODE_ALLOWED = True
+
 
 tf_agents_gauge = monitoring.BoolGauge('/tensorflow/agents/agents',
                                        'TF-Agents usage', 'method')
@@ -47,6 +58,18 @@ code to your main() method:
   tf.compat.v1.enable_resource_variables()
 For unit tests, subclass `tf_agents.utils.test_utils.TestCase`.
 """
+
+
+def check_tf1_allowed():
+  """Raises an error if running in TF1 (non-eager) mode and this is disabled."""
+  if _TF1_MODE_ALLOWED:
+    return
+  if not tf2_checker.enabled():
+    raise RuntimeError(
+        'You are using TF1 or running TF with eager mode disabled.  '
+        'TF-Agents no longer supports TF1 mode (except for a shrinking list of '
+        'internal whitelisted users).  If this negatively affects you, please '
+        'reach out to the TF-Agents team.  Otherwise please use TF2.')
 
 
 def resource_variables_enabled():
@@ -125,6 +148,7 @@ def function_in_tf1(*args, **kwargs):
     @functools.wraps(fn)
     def with_check_resource_vars(*fn_args, **fn_kwargs):
       """Helper function for calling common.function."""
+      check_tf1_allowed()
       if has_eager_been_enabled():
         # We're either in eager mode or in tf.function mode (no in-between); so
         # autodep-like behavior is already expected of fn.
@@ -147,6 +171,7 @@ def create_variable(name,
                     initializer=None,
                     unique_name=True):
   """Create a variable."""
+  check_tf1_allowed()
   if has_eager_been_enabled():
     if initializer is None:
       if shape:
@@ -1180,3 +1205,58 @@ def maybe_copy_target_network_with_checks(network, target_network=None,
   check_no_shared_variables(network, target_network)
   check_matching_networks(network, target_network)
   return target_network
+
+
+AggregatedLosses = cs.namedtuple(
+    'AggregatedLosses',
+    ['total_loss',  # Total loss = weighted + regularization
+     'weighted',  # Weighted sum of per_example_loss by sample_weight.
+     'regularization',  # Total of regularization losses.
+    ])
+
+
+def aggregate_losses(per_example_loss=None,
+                     sample_weight=None,
+                     global_batch_size=None,
+                     regularization_loss=None):
+  """Aggregates and scales per example loss and regularization losses.
+
+  If `global_batch_size` is given it would be used for scaling, otherwise it
+  would use the batch_dim of per_example_loss and number of replicas.
+
+  Args:
+    per_example_loss: Per-example loss [B].
+    sample_weight: Optional weighting for each example [B].
+    global_batch_size: Optional global batch size value. Defaults to (size of
+    first dimension of `losses`) * (number of replicas).
+    regularization_loss: Regularization loss.
+
+  Returns:
+    An AggregatedLosses named tuple with scalar losses to optimize.
+  """
+  total_loss, weighted_loss, reg_loss = None, None, None
+  # Compute loss that is scaled by global batch size.
+  if per_example_loss is not None:
+    weighted_loss = tf.nn.compute_average_loss(
+        per_example_loss,
+        sample_weight=sample_weight,
+        global_batch_size=global_batch_size)
+    total_loss = weighted_loss
+  # Add scaled regularization losses.
+  if regularization_loss is not None:
+    reg_loss = tf.nn.scale_regularization_loss(regularization_loss)
+    if total_loss is None:
+      total_loss = reg_loss
+    else:
+      total_loss += reg_loss
+  return AggregatedLosses(total_loss, weighted_loss, reg_loss)
+
+
+def summarize_scalar_dict(name_data, step, name_scope='Losses/'):
+  if name_data:
+    with tf.name_scope(name_scope):
+      for name, data in name_data.items():
+        if data is not None:
+          tf.compat.v2.summary.scalar(
+              name=name, data=data, step=step)
+

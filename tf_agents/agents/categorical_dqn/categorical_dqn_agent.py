@@ -36,6 +36,7 @@ from tf_agents.policies import boltzmann_policy
 from tf_agents.policies import categorical_q_policy
 from tf_agents.policies import epsilon_greedy_policy
 from tf_agents.policies import greedy_policy
+from tf_agents.trajectories import trajectory
 from tf_agents.utils import common
 from tf_agents.utils import nest_utils
 from tf_agents.utils import value_ops
@@ -268,17 +269,24 @@ class CategoricalDqnAgent(dqn_agent.DqnAgent):
     # method requires a time dimension to compute the loss properly.
     self._check_trajectory_dimensions(experience)
 
+    squeeze_time_dim = not self._q_network.state_spec
     if self._n_step_update == 1:
-      time_steps, actions, next_time_steps = self._experience_to_transitions(
-          experience)
+      time_steps, policy_steps, next_time_steps = (
+          trajectory.experience_to_transitions(experience, squeeze_time_dim))
+      actions = policy_steps.action
     else:
       # To compute n-step returns, we need the first time steps, the first
       # actions, and the last time steps. Therefore we extract the first and
       # last transitions from our Trajectory.
       first_two_steps = tf.nest.map_structure(lambda x: x[:, :2], experience)
       last_two_steps = tf.nest.map_structure(lambda x: x[:, -2:], experience)
-      time_steps, actions, _ = self._experience_to_transitions(first_two_steps)
-      _, _, next_time_steps = self._experience_to_transitions(last_two_steps)
+      time_steps, policy_steps, _ = (
+          trajectory.experience_to_transitions(
+              first_two_steps, squeeze_time_dim))
+      actions = policy_steps.action
+      _, _, next_time_steps = (
+          trajectory.experience_to_transitions(
+              last_two_steps, squeeze_time_dim))
 
     with tf.name_scope('critic_loss'):
       tf.nest.assert_same_structure(actions, self.action_spec)
@@ -393,21 +401,28 @@ class CategoricalDqnAgent(dqn_agent.DqnAgent):
       if batch_squash is not None:
         target_distribution = batch_squash.unflatten(target_distribution)
         chosen_action_logits = batch_squash.unflatten(chosen_action_logits)
-        critic_loss = tf.reduce_mean(
-            tf.reduce_sum(
-                tf.compat.v1.nn.softmax_cross_entropy_with_logits_v2(
-                    labels=target_distribution,
-                    logits=chosen_action_logits),
-                axis=1))
-      else:
-        critic_loss = tf.reduce_mean(
+        critic_loss = tf.reduce_sum(
             tf.compat.v1.nn.softmax_cross_entropy_with_logits_v2(
                 labels=target_distribution,
-                logits=chosen_action_logits))
+                logits=chosen_action_logits),
+            axis=1)
+      else:
+        critic_loss = tf.compat.v1.nn.softmax_cross_entropy_with_logits_v2(
+            labels=target_distribution,
+            logits=chosen_action_logits)
 
-      with tf.name_scope('Losses/'):
-        tf.compat.v2.summary.scalar(
-            'critic_loss', critic_loss, step=self.train_step_counter)
+      agg_loss = common.aggregate_losses(
+          per_example_loss=critic_loss,
+          regularization_loss=self._q_network.losses)
+      total_loss = agg_loss.total_loss
+
+      dict_losses = {'critic_loss': agg_loss.weighted,
+                     'reg_loss': agg_loss.regularization,
+                     'total_loss': total_loss}
+
+      common.summarize_scalar_dict(dict_losses,
+                                   step=self.train_step_counter,
+                                   name_scope='Losses/')
 
       if self._debug_summaries:
         distribution_errors = target_distribution - chosen_action_logits
@@ -434,8 +449,8 @@ class CategoricalDqnAgent(dqn_agent.DqnAgent):
 
       # TODO(b/127318640): Give appropriate values for td_loss and td_error for
       # prioritized replay.
-      return tf_agent.LossInfo(critic_loss, dqn_agent.DqnLossInfo(td_loss=(),
-                                                                  td_error=()))
+      return tf_agent.LossInfo(total_loss, dqn_agent.DqnLossInfo(td_loss=(),
+                                                                 td_error=()))
 
   def _next_q_distribution(self, next_time_steps):
     """Compute the q distribution of the next state for TD error computation.

@@ -67,7 +67,7 @@ def _copy_layer(layer):
     raise ValueError('DenseFeatures V1 is not supported. '
                      'Use tf.compat.v2.keras.layers.DenseFeatures instead.')
   if layer.built:
-    logging.warn(
+    logging.warning(
         'Beware: Copying a layer that has already been built: \'%s\'.  '
         'This can lead to subtle bugs because the original layer\'s weights '
         'will not be used in the copy.', layer.name)
@@ -244,8 +244,7 @@ class EncodingNetwork(network.Network):
                 dilation_rate=dilation_rate,
                 activation=activation_fn,
                 kernel_initializer=kernel_initializer,
-                dtype=dtype,
-                name='%s/conv%s' % (name, conv_type)))
+                dtype=dtype))
 
     layers.append(tf.keras.layers.Flatten())
 
@@ -276,8 +275,7 @@ class EncodingNetwork(network.Network):
                 activation=activation_fn,
                 kernel_initializer=kernel_initializer,
                 kernel_regularizer=kernal_regularizer,
-                dtype=dtype,
-                name='%s/dense' % name))
+                dtype=dtype))
         if not isinstance(dropout_params, dict):
           dropout_params = {'rate': dropout_params} if dropout_params else None
 
