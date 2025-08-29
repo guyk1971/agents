@@ -1,7 +1,6 @@
 #!/bin/bash
-# Usage: ./docker_build_run_lws.sh [WITH_OLLAMA=true]
-# If WITH_OLLAMA=true, the script will setup Ollama and use the llmnet network.
-# If WITH_OLLAMA=false (default) the script will use the default network.
+# Usage: ./docker_build_run_lws.sh [model_name]
+# If a model name is provided, the script will setup Ollama and use the llmnet network.
 
 # DIR is the directory where the script is saved (should be <project_root/scripts)
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
@@ -25,7 +24,7 @@ BASE_IMAGE=nvcr.io/nvidia/pytorch:23.10-py3
 mkdir -p ${DIR}/.cursor-server
 
 LINK=$(realpath --relative-to="/home/${MY_UNAME}" "$DIR" -s)
-IMAGE=gaisb_12_3:latest
+IMAGE=agents_udemy:latest
 if [ -z "$(docker images -q ${IMAGE})" ]; then
     # Create dev.dockerfile
     FILE=dev.dockerfile
@@ -54,20 +53,37 @@ if [ -z "$(docker images -q ${IMAGE})" ]; then
     # echo "  WORKDIR ${CUDA_HOME}/cuda-samples" >> $FILE
     # echo "  RUN make TARGET_ARCH=x86_64 SMS='89'" >> $FILE
 
+    # Configure uv environment (as root before switching user)
+    echo "  ENV UV_PROJECT_ENVIRONMENT=/opt/venv" >> $FILE
+    echo "  ENV UV_PYTHON_PREFERENCE=system" >> $FILE
+    echo "  RUN mkdir -p /opt/venv" >> $FILE
+    echo "  RUN chown -R ${MY_UNAME}:${MY_GID} /opt/venv" >> $FILE
+    echo "  ENV PATH=\"/opt/venv/bin:\$PATH\"" >> $FILE
+
     echo "  USER $MY_UNAME" >> $FILE
-    echo "  COPY docker.bashrc /home/${MY_UNAME}/.bashrc" >> $FILE 
+    echo "  COPY env_scripts/docker.bashrc /home/${MY_UNAME}/.bashrc" >> $FILE 
     
    # START: install any additional package required for your image here
-    # echo "  COPY requirements.txt /home/${MY_UNAME}/requirements.txt" >> $FILE
-    # echo "  RUN pip install -r /home/${MY_UNAME}/requirements.txt" >> $FILE
-    echo "  RUN pip install transformers accelerate bitsandbytes peft datasets dotenv openai huggingface_hub[hf_xet]" >> $FILE
+    # Install uv for dependency management
+    echo "  RUN curl -LsSf https://astral.sh/uv/install.sh | sh" >> $FILE
+    echo "  ENV PATH=\"/home/${MY_UNAME}/.local/bin:\$PATH\"" >> $FILE
+    
+    # Install setuptools for distutils compatibility with older packages  
+    echo "  RUN pip install 'setuptools<72' wheel packaging" >> $FILE
+    # Add environment variable to help setuptools provide distutils functionality
+    echo "  ENV SETUPTOOLS_USE_DISTUTILS=local" >> $FILE
+    
+    # Copy dependency files (available for manual uv sync inside container)
+    echo "  COPY --chown=${MY_UNAME}:${MY_GID} pyproject.toml uv.lock ${DIR}/../" >> $FILE
+    echo "  WORKDIR $DIR/.." >> $FILE
+    
+    # Note: Dependencies can be installed manually with: uv sync --frozen --python-preference=system
     # END: install any additional package required for your image here
     echo "  RUN . /home/${MY_UNAME}/.bashrc" >> $FILE
-    echo "  WORKDIR $DIR/.." >> $FILE
     # echo "  RUN pip install -e $DIR/.." >> $FILE
     echo "  CMD /bin/bash" >> $FILE
 
-    docker buildx build -f dev.dockerfile -t ${IMAGE} .
+    docker buildx build -f dev.dockerfile -t ${IMAGE} ..
 fi
 
 EXTRA_MOUNTS=""
@@ -75,7 +91,7 @@ EXTRA_MOUNTS=""
 # if [ -d "/home/${MY_UNAME}/.cache/" ]; then
 #     EXTRA_MOUNTS+=" --mount type=bind,source=/home/${MY_UNAME}/scratch,target=/home/${MY_UNAME}/scratch"
 # fi
-CACHE_FOLDER_ON_HOST=/home/${MY_UNAME}/scratch/.cache/
+CACHE_FOLDER_ON_HOST=/home/${MY_UNAME}/.cache/
 MOUNT_CACHE_FOLDER=" --mount type=bind,source=${CACHE_FOLDER_ON_HOST},target=/home/${MY_UNAME}/.cache"
 
 CODE_FOLDER=/home/${MY_UNAME}/code
@@ -84,20 +100,20 @@ MOUNT_CODE_FOLDER="--mount type=bind,source=${CODE_FOLDER},target=${CODE_FOLDER}
 DATA_FOLDER=/home/${MY_UNAME}/data
 MOUNT_DATA_FOLDER=" --mount type=bind,source=${DATA_FOLDER},target=${DATA_FOLDER}"
 
-# Parse WITH_OLLAMA argument (default: true)
-WITH_OLLAMA=false
-if [[ "$1" == "WITH_OLLAMA="* ]]; then
-    WITH_OLLAMA="${1#WITH_OLLAMA=}"
-    shift
-fi
+# If a model name is provided, setup Ollama and use the llmnet network.
+MODEL_NAME=$1
+NETWORK_ARG=""
 
-# Only run Ollama setup if WITH_OLLAMA is true
-if [[ "$WITH_OLLAMA" == "true" || "$WITH_OLLAMA" == "True" ]]; then
+if [ ! -z "$MODEL_NAME" ]; then
     # Ensure the llmnet network exists
     docker network inspect llmnet >/dev/null 2>&1 || docker network create llmnet
 
-    MODEL_NAME=qwen3:8b
-    docker run -d --rm --gpus all --name ollama --network llmnet -p 11434:11434 ollama/ollama
+    # Check if ollama container is already running, if not start it
+    if [ ! "$(docker ps -q -f name=ollama)" ]; then
+        # Stop and remove any stopped container with the same name
+        docker rm -f ollama 2>/dev/null || true
+        docker run -d --rm --gpus all --name ollama --network llmnet -p 11434:11434 ollama/ollama
+    fi
 
     # Wait until Ollama API is ready
     until curl -s http://localhost:11434 | grep -q 'Ollama'; do
@@ -106,11 +122,6 @@ if [[ "$WITH_OLLAMA" == "true" || "$WITH_OLLAMA" == "True" ]]; then
     done
 
     docker exec -it ollama ollama pull ${MODEL_NAME}
-fi
-
-# If WITH_OLLAMA is true, use --network llmnet, else use default network
-NETWORK_ARG=""
-if [[ "$WITH_OLLAMA" == "true" || "$WITH_OLLAMA" == "True" ]]; then
     NETWORK_ARG="--network llmnet"
 fi
 

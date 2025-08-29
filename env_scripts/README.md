@@ -49,3 +49,13 @@ Now the container is ready for development. its time to commit it to an image
     or just use the container name
 
 from now on, you can use the `docker_run_lws.sh` script to run the container.
+
+## Ollama Integration
+
+The `ollama_docker_build_run_x299.sh` and `ollama_docker_build_run_lws.sh` scripts can be used to launch the Ollama container alongside the development container. To use this functionality, simply pass the name of the model you want to use as an argument to the script. For example:
+
+```bash
+./env_scripts/ollama_docker_build_run_x299.sh qwen:8b
+```
+
+This will start the Ollama container and pull the `qwen:8b` model. The development container will be connected to the same network as the Ollama container, so you can access the Ollama API from within the development container.
